@@ -11,24 +11,16 @@ if getattr(sys, "frozen", False):
     HERE = os.path.dirname(sys.executable)   # exe 所在目录
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE  = os.path.join(HERE, "config.json")
-CHECK_EVERY  = 10
+CONFIG_FILE       = os.path.join(HERE, "config.json")
+ROUTER_CONFIG_FILE = os.path.join(HERE, "router_config.json")
+CHECK_EVERY       = 10
 
 # 默认配置（首次运行时写入 config.json）
 DEFAULT_CONFIG = {
     "state": "disabled",
     "last_switch": "",
-    "cycle_seconds": 43200,         # 12 小时
+    "cycle_seconds": 86400,         # 24 小时（断 24h + 通 24h 循环）
     "adapter": "WLAN",
-    "router": {
-        "enabled": True,           # 是否启用路由器 MAC 过滤（双重断网）
-        "host": "192.168.1.1",
-        "username": "user",
-        "password": "2n#phm9c",
-        "target_macs": [           # 要禁的手机 MAC 列表
-            "aa:3f:6c:5b:e4:2c"
-        ],
-    },
     "sports": {
         "upload_folder": "上传运动文件",   # 相对路径，运行时解析为 HERE 的子目录
         "storage_folder": "运动记录",      # 相对路径
@@ -36,8 +28,16 @@ DEFAULT_CONFIG = {
         "reduce_per_upload": 3600, # 每次上传减 1 小时（秒）
         "today_reduced": 0,        # 今天已减时长（秒）
         "last_reduce_date": "",    # 上次减时的日期（用于判断是否跨天）
-        "processed_files": [],     # 已处理过的文件名列表（防重复）
     },
+}
+
+# 路由器配置模板（首次运行时写入 router_config.json，明文存储）
+DEFAULT_ROUTER_CONFIG = {
+    "enabled": True,           # 是否启用路由器 MAC 过滤（双重断网）
+    "host": "192.168.1.1",
+    "username": "",
+    "password": "",
+    "target_macs": [],         # 要禁的手机 MAC 列表
 }
 
 
@@ -58,6 +58,17 @@ def save_config(cfg: dict) -> None:
     """加密写入 config（DPAPI 加密，密钥由 Windows 管理）"""
     from config_crypto import save_config as _save_encrypted
     _save_encrypted(cfg, CONFIG_FILE)
+
+
+def load_router_config() -> dict:
+    """读取路由器配置（明文存储），不存在则创建默认模板"""
+    if not os.path.exists(ROUTER_CONFIG_FILE):
+        # 创建默认模板（空密码，需要用户自己填）
+        with open(ROUTER_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_ROUTER_CONFIG, f, ensure_ascii=False, indent=2)
+        print(f"[路由器配置] 已创建 {ROUTER_CONFIG_FILE}，请手动填写用户名密码和 MAC 地址")
+    with open(ROUTER_CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _netsh_set(adapter: str, enable: bool) -> None:
@@ -122,11 +133,16 @@ def _apply_local(cfg: dict, target_state: str) -> bool:
     return True
 
 
-def _apply_router(cfg: dict, target_state: str) -> bool:
+def _apply_router(_cfg: dict, target_state: str) -> bool:
     """操作路由器 MAC 过滤，失败自动重试"""
-    router_cfg = cfg.get("router", {})
+    router_cfg = load_router_config()
     if not (router_cfg.get("enabled") and router_cfg.get("target_macs")):
         return True
+
+    # 检查密码是否已填写
+    if not router_cfg.get("username") or not router_cfg.get("password"):
+        print("[路由器] 用户名或密码未填写，请编辑 router_config.json")
+        return False
 
     max_retries = 5
     for attempt in range(1, max_retries + 1):
@@ -171,32 +187,15 @@ def _apply_router(cfg: dict, target_state: str) -> bool:
     return False
 
 
-def init_config() -> dict:
-    """首次运行：创建默认 config 并执行禁用"""
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
-    now = dt.datetime.now()
-    cfg["last_switch"] = now.isoformat(timespec="seconds")
-    apply_state(cfg, "disabled")
-    # 创建上传/存储文件夹（相对路径解析为 HERE 的子目录）
-    upload_folder = os.path.join(HERE, cfg["sports"]["upload_folder"])
-    storage_folder = os.path.join(HERE, cfg["sports"]["storage_folder"])
-    os.makedirs(upload_folder, exist_ok=True)
-    os.makedirs(storage_folder, exist_ok=True)
-    save_config(cfg)
-    print(f"[初始化] 已创建 config.json，状态=disabled, 周期={cfg['cycle_seconds']}s")
-    return cfg
-
-
 def _scan_sports_files(cfg: dict) -> list[str]:
     """扫描上传文件夹，返回未处理的文件列表"""
     upload_folder = os.path.join(HERE, cfg["sports"]["upload_folder"])
     if not os.path.exists(upload_folder):
         return []
-    processed = set(cfg["sports"]["processed_files"])
     new_files = []
     for fname in os.listdir(upload_folder):
         fpath = os.path.join(upload_folder, fname)
-        if os.path.isfile(fpath) and fname not in processed:
+        if os.path.isfile(fpath):
             ext = os.path.splitext(fname)[1].lower()
             if ext in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mov", ".avi", ".mkv"):
                 new_files.append(fpath)
@@ -211,7 +210,6 @@ def _process_sports_file(cfg: dict, fpath: str) -> bool:
     os.makedirs(day_folder, exist_ok=True)
     fname = os.path.basename(fpath)
     new_path = os.path.join(day_folder, fname)
-    # 防重名：如果已存在加时间戳
     if os.path.exists(new_path):
         base, ext = os.path.splitext(fname)
         ts = dt.datetime.now().strftime("%H%M%S")
@@ -232,7 +230,7 @@ def _reduce_time(cfg: dict) -> None:
 
     sports_cfg = cfg["sports"]
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    # 跨天重置已减时长
+
     if sports_cfg["last_reduce_date"] != today:
         sports_cfg["today_reduced"] = 0
         sports_cfg["last_reduce_date"] = today
@@ -242,32 +240,53 @@ def _reduce_time(cfg: dict) -> None:
         fname = os.path.basename(fpath)
         if cfg["state"] != "disabled":
             print(f"[运动] 当前不是断网状态，跳过: {fname}")
-            sports_cfg["processed_files"].append(fname)
-            save_config(cfg)
+            _process_sports_file(cfg, fpath)
             continue
 
         remaining_limit = sports_cfg["daily_limit_hours"] * 3600 - sports_cfg["today_reduced"]
         if remaining_limit <= 0:
             print(f"[运动] 今天已减够 {sports_cfg['daily_limit_hours']} 小时，跳过: {fname}")
-            sports_cfg["processed_files"].append(fname)
-            save_config(cfg)
+            _process_sports_file(cfg, fpath)
             continue
 
-        # 执行减时：把 last_switch 往后推，相当于减少剩余断网时间
         last = dt.datetime.fromisoformat(cfg["last_switch"])
         reduce_sec = min(sports_cfg["reduce_per_upload"], remaining_limit)
         new_last = last + dt.timedelta(seconds=reduce_sec)
         cfg["last_switch"] = new_last.isoformat(timespec="seconds")
         sports_cfg["today_reduced"] += reduce_sec
-        sports_cfg["processed_files"].append(fname)
 
-        # 移到存储目录
         if _process_sports_file(cfg, fpath):
             print(f"[运动] ✓ 上传成功！减时 {reduce_sec//3600} 小时，今天已减 {sports_cfg['today_reduced']//3600} 小时")
         else:
             print(f"[运动] ✗ 文件移动失败，但减时已生效")
 
         save_config(cfg)
+
+
+def init_config() -> dict:
+    """首次运行：创建默认 config 并执行禁用"""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    now = dt.datetime.now()
+    cfg["last_switch"] = now.isoformat(timespec="seconds")
+
+    router_cfg = load_router_config()
+
+    upload_folder = os.path.join(HERE, cfg["sports"]["upload_folder"])
+    storage_folder = os.path.join(HERE, cfg["sports"]["storage_folder"])
+    os.makedirs(upload_folder, exist_ok=True)
+    os.makedirs(storage_folder, exist_ok=True)
+
+    save_config(cfg)
+
+    if router_cfg.get("enabled") and (not router_cfg.get("username") or not router_cfg.get("password")):
+        print(f"[初始化] 已创建 config.json，状态=disabled")
+        print(f"[初始化] 路由器密码未填写，只禁用本地网卡")
+        _apply_local(cfg, "disabled")
+        print(f"[初始化] 请编辑 router_config.json 填写用户名密码和 MAC，然后重启")
+    else:
+        apply_state(cfg, "disabled")
+        print(f"[初始化] 已创建 config.json，状态=disabled, 周期={cfg['cycle_seconds']}s")
+    return cfg
 
 
 def main() -> int:
@@ -311,7 +330,6 @@ def main() -> int:
                 cfg["last_switch"] = now.isoformat(timespec="seconds")
                 save_config(cfg)
 
-            # 扫描运动文件（每 CHECK_EVERY 秒扫描一次）
             _reduce_time(cfg)
 
             time.sleep(CHECK_EVERY)
