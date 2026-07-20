@@ -18,7 +18,7 @@ CHECK_EVERY  = 10
 DEFAULT_CONFIG = {
     "state": "disabled",
     "last_switch": "",
-    "cycle_seconds": 86400,         # 24 小时（断 24h + 通 24h 循环）
+    "cycle_seconds": 43200,         # 12 小时
     "adapter": "WLAN",
     "router": {
         "enabled": True,           # 是否启用路由器 MAC 过滤（双重断网）
@@ -28,6 +28,15 @@ DEFAULT_CONFIG = {
         "target_macs": [           # 要禁的手机 MAC 列表
             "aa:3f:6c:5b:e4:2c"
         ],
+    },
+    "sports": {
+        "upload_folder": "上传运动文件",   # 相对路径，运行时解析为 HERE 的子目录
+        "storage_folder": "运动记录",      # 相对路径
+        "daily_limit_hours": 3,    # 每天最多减 3 小时
+        "reduce_per_upload": 3600, # 每次上传减 1 小时（秒）
+        "today_reduced": 0,        # 今天已减时长（秒）
+        "last_reduce_date": "",    # 上次减时的日期（用于判断是否跨天）
+        "processed_files": [],     # 已处理过的文件名列表（防重复）
     },
 }
 
@@ -88,7 +97,7 @@ def _apply_local(cfg: dict, target_state: str) -> bool:
 
     # 启用网卡后，等几秒让网络就绪（DHCP 分配 IP 需要时间）
     if target_state == "enabled":
-        print(f"[本地网卡] 等待网络连接 ...", flush=True)
+        print(f"[本地网卡] 等待网络连接 ...", end="", flush=True)
         max_wait = 30
         waited = 0
         while waited < max_wait:
@@ -97,30 +106,19 @@ def _apply_local(cfg: dict, target_state: str) -> bool:
                 shell=True, capture_output=True, text=True,
                 creationflags=0x08000000,
             )
-            # 调试：打印 netsh 原始输出（前 10 行）
-            lines = cp.stdout.splitlines()
-            if waited == 0:
-                print(f"  [调试] netsh 输出 ({len(lines)} 行):")
-                for l in lines[:8]:
-                    print(f"    | {l}")
-
             connected = False
-            for line in lines:
-                if cfg["adapter"] in line:
-                    print(f"  [调试] 匹配到网卡行: {line.strip()}")
-                    # 匹配 Connected 或 已连接（中英文系统都兼容）
-                    if "Connected" in line or "已连接" in line:
-                        connected = True
+            for line in cp.stdout.splitlines():
+                if cfg["adapter"] in line and ("Connected" in line or "已连接" in line):
+                    connected = True
                     break
             if connected:
-                # 再多等 2 秒让路由/ARP 表就绪
                 time.sleep(2)
-                print("  ✓ 已连接")
+                print(" 已连接")
                 return True
             time.sleep(2)
             waited += 2
-            print(f"  ... 等待中 ({waited}s/{max_wait}s)", flush=True)
-        print("  ✗ 超时（但可能已联网，继续尝试访问路由器）")
+            print(".", end="", flush=True)
+        print(" 超时（但可能已联网，继续尝试访问路由器）")
     return True
 
 
@@ -179,9 +177,97 @@ def init_config() -> dict:
     now = dt.datetime.now()
     cfg["last_switch"] = now.isoformat(timespec="seconds")
     apply_state(cfg, "disabled")
+    # 创建上传/存储文件夹（相对路径解析为 HERE 的子目录）
+    upload_folder = os.path.join(HERE, cfg["sports"]["upload_folder"])
+    storage_folder = os.path.join(HERE, cfg["sports"]["storage_folder"])
+    os.makedirs(upload_folder, exist_ok=True)
+    os.makedirs(storage_folder, exist_ok=True)
     save_config(cfg)
     print(f"[初始化] 已创建 config.json，状态=disabled, 周期={cfg['cycle_seconds']}s")
     return cfg
+
+
+def _scan_sports_files(cfg: dict) -> list[str]:
+    """扫描上传文件夹，返回未处理的文件列表"""
+    upload_folder = os.path.join(HERE, cfg["sports"]["upload_folder"])
+    if not os.path.exists(upload_folder):
+        return []
+    processed = set(cfg["sports"]["processed_files"])
+    new_files = []
+    for fname in os.listdir(upload_folder):
+        fpath = os.path.join(upload_folder, fname)
+        if os.path.isfile(fpath) and fname not in processed:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mov", ".avi", ".mkv"):
+                new_files.append(fpath)
+    return new_files
+
+
+def _process_sports_file(cfg: dict, fpath: str) -> bool:
+    """把运动文件移到按日期分类的存储目录"""
+    storage_folder = os.path.join(HERE, cfg["sports"]["storage_folder"])
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    day_folder = os.path.join(storage_folder, today)
+    os.makedirs(day_folder, exist_ok=True)
+    fname = os.path.basename(fpath)
+    new_path = os.path.join(day_folder, fname)
+    # 防重名：如果已存在加时间戳
+    if os.path.exists(new_path):
+        base, ext = os.path.splitext(fname)
+        ts = dt.datetime.now().strftime("%H%M%S")
+        new_path = os.path.join(day_folder, f"{base}_{ts}{ext}")
+    try:
+        os.rename(fpath, new_path)
+        return True
+    except Exception as e:
+        print(f"[运动] 移动文件失败: {e}")
+        return False
+
+
+def _reduce_time(cfg: dict) -> None:
+    """扫描运动文件并执行减时逻辑"""
+    new_files = _scan_sports_files(cfg)
+    if not new_files:
+        return
+
+    sports_cfg = cfg["sports"]
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    # 跨天重置已减时长
+    if sports_cfg["last_reduce_date"] != today:
+        sports_cfg["today_reduced"] = 0
+        sports_cfg["last_reduce_date"] = today
+        save_config(cfg)
+
+    for fpath in new_files:
+        fname = os.path.basename(fpath)
+        if cfg["state"] != "disabled":
+            print(f"[运动] 当前不是断网状态，跳过: {fname}")
+            sports_cfg["processed_files"].append(fname)
+            save_config(cfg)
+            continue
+
+        remaining_limit = sports_cfg["daily_limit_hours"] * 3600 - sports_cfg["today_reduced"]
+        if remaining_limit <= 0:
+            print(f"[运动] 今天已减够 {sports_cfg['daily_limit_hours']} 小时，跳过: {fname}")
+            sports_cfg["processed_files"].append(fname)
+            save_config(cfg)
+            continue
+
+        # 执行减时：把 last_switch 往后推，相当于减少剩余断网时间
+        last = dt.datetime.fromisoformat(cfg["last_switch"])
+        reduce_sec = min(sports_cfg["reduce_per_upload"], remaining_limit)
+        new_last = last + dt.timedelta(seconds=reduce_sec)
+        cfg["last_switch"] = new_last.isoformat(timespec="seconds")
+        sports_cfg["today_reduced"] += reduce_sec
+        sports_cfg["processed_files"].append(fname)
+
+        # 移到存储目录
+        if _process_sports_file(cfg, fpath):
+            print(f"[运动] ✓ 上传成功！减时 {reduce_sec//3600} 小时，今天已减 {sports_cfg['today_reduced']//3600} 小时")
+        else:
+            print(f"[运动] ✗ 文件移动失败，但减时已生效")
+
+        save_config(cfg)
 
 
 def main() -> int:
@@ -224,6 +310,9 @@ def main() -> int:
                 cfg["state"] = new_state
                 cfg["last_switch"] = now.isoformat(timespec="seconds")
                 save_config(cfg)
+
+            # 扫描运动文件（每 CHECK_EVERY 秒扫描一次）
+            _reduce_time(cfg)
 
             time.sleep(CHECK_EVERY)
         except KeyboardInterrupt:
