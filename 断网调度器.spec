@@ -6,7 +6,7 @@ hiddenimports += collect_submodules('requests')
 
 
 a = Analysis(
-    ['调度.py'],
+    ['调度_固定.py'],
     pathex=[],
     binaries=[],
     datas=[],
