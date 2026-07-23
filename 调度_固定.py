@@ -10,7 +10,7 @@ if getattr(sys, "frozen", False):
     HERE = os.path.dirname(sys.executable)
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(HERE, "config.json")
+CONFIG_FILE = os.path.join(HERE, "config_fixed.json")
 ROUTER_CONFIG_FILE = os.path.join(HERE, "router_config.json")
 CHECK_EVERY = 10
 
@@ -340,13 +340,23 @@ def main() -> int:
     if cfg is None:
         cfg = init_config()
     else:
-        print(f"[启动] 读取 config.json，当前状态={cfg['state']}")
+        print(f"[启动] 读取 config_fixed.json，当前状态={cfg['state']}")
         changed = False
         for k, v in DEFAULT_CONFIG.items():
             if k not in cfg:
                 cfg[k] = v if not isinstance(v, (dict, list)) else json.loads(json.dumps(v))
                 changed = True
         if changed:
+            save_config(cfg)
+
+        now = dt.datetime.now()
+        expected_state, expected_last_switch, expected_target_on = _determine_initial_state(cfg)
+
+        if cfg["state"] != expected_state:
+            print(f"[启动修正] 配置状态={cfg['state']} 与当前时间窗口预期状态={expected_state} 不一致，强制修正")
+            cfg["state"] = expected_state
+            cfg["last_switch"] = expected_last_switch
+            cfg["target_on_time"] = expected_target_on
             save_config(cfg)
 
         if cfg.get("target_on_time"):
